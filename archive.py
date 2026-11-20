@@ -31,7 +31,20 @@ CREATE TABLE IF NOT EXISTS attachment_chunks(
     data BLOB NOT NULL,
     PRIMARY KEY(name, part)
 );
+CREATE TABLE IF NOT EXISTS evidences(
+    id TEXT PRIMARY KEY NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    size INTEGER NOT NULL CHECK(size >= 0),
+    sha256 TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS evidence_chunks(
+    id TEXT NOT NULL REFERENCES evidences(id) ON DELETE CASCADE,
+    part INTEGER NOT NULL CHECK(part >= 0),
+    data BLOB NOT NULL,
+    PRIMARY KEY(id, part)
+);
 """
+_EVIDENCE_TABLES = ("evidences", "evidence_chunks", "id")
+_ATTACHMENT_TABLES = ("attachments", "attachment_chunks", "name")
 
 
 def _text(value, label):
@@ -144,7 +157,7 @@ def read_flat(chunks, record_name="r"):
 
 
 class _ChunkReader(io.RawIOBase):
-    def __init__(self, path, name):
+    def __init__(self, path, name, tables=_ATTACHMENT_TABLES):
         super().__init__()
         self._conn = None
         self._cursor = None
@@ -153,8 +166,11 @@ class _ChunkReader(io.RawIOBase):
         try:
             self._conn.execute("PRAGMA query_only=ON")
             self._conn.execute("PRAGMA cache_size=-512")
+            header_table, chunk_table, key_column = tables
+            # Table names come from fixed internal constants, never user input.
             self._cursor = self._conn.execute(
-                "SELECT data FROM attachment_chunks WHERE name=? ORDER BY part", (name,))
+                "SELECT data FROM " + chunk_table + " WHERE " + key_column
+                + "=? ORDER BY part", (name,))
         except BaseException:
             self._conn.close()
             raise
@@ -241,6 +257,33 @@ class Batch:
             conn.execute("UPDATE attachments SET size=?, sha256=? WHERE name=?",
                          (size, digest.hexdigest(), name))
 
+    def put_evidence(self, ident, chunks):
+        """Stream an independently replayable XML evidence for one row.
+
+        The evidence key space is separate from generic attachments: an
+        attachment whose name equals a record id is never touched, and an
+        evidence can only be created together with its row inside one batch.
+        """
+        with self._writing() as conn:
+            _text(ident, "id")
+            try:
+                conn.execute("INSERT INTO evidences VALUES(?,0,'')", (ident,))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("duplicate evidence id") from exc
+            digest = hashlib.sha256()
+            size = 0
+            part = 0
+            for block in byte_chunks(chunks):
+                if not block:
+                    continue
+                conn.execute("INSERT INTO evidence_chunks VALUES(?,?,?)",
+                             (ident, part, block))
+                digest.update(block)
+                size += len(block)
+                part += 1
+            conn.execute("UPDATE evidences SET size=?, sha256=? WHERE id=?",
+                         (size, digest.hexdigest(), ident))
+
 
 class Archive:
     """One writer, append-only rows and separately named binary attachments."""
@@ -301,6 +344,26 @@ class Archive:
                 count += 1
         return count
 
+    def ingest_scoped(self, chunks, record_name, source_base):
+        """Import scoped XML records and their independent evidence.
+
+        Rows and evidence are staged to disk while streaming and published in
+        the existing transaction, so any failure leaves prior rows, generic
+        attachments and evidence untouched.  See SCOPED.md for the contract.
+        """
+        import scoped
+        import shutil
+        import tempfile
+
+        staging = tempfile.mkdtemp(prefix="scoped-evidence-",
+                                   dir=os.path.dirname(self._path) or ".")
+        try:
+            with self.transaction() as batch:
+                return scoped.run_scoped(
+                    batch, chunks, staging, record_name, source_base)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
     def row(self, ident):
         self._idle()
         _text(ident, "id")
@@ -325,7 +388,28 @@ class Archive:
 
     def attachment(self, name):
         self.attachment_info(name)
-        reader = io.BufferedReader(_ChunkReader(self._path, name), buffer_size=MAX_CHUNK)
+        reader = io.BufferedReader(
+            _ChunkReader(self._path, name, _ATTACHMENT_TABLES),
+            buffer_size=MAX_CHUNK)
+        self._readers.add(reader)
+        return reader
+
+    def evidence_info(self, ident):
+        self._idle()
+        _text(ident, "id")
+        row = self._conn.execute(
+            "SELECT size,sha256 FROM evidences WHERE id=?", (ident,)).fetchone()
+        if row is None:
+            raise KeyError(ident)
+        return row
+
+    def evidence(self, ident):
+        # KeyError here also covers old rows without evidence and bad id text
+        # rules inherited from the existing query parameter validation.
+        self.evidence_info(ident)
+        reader = io.BufferedReader(
+            _ChunkReader(self._path, ident, _EVIDENCE_TABLES),
+            buffer_size=MAX_CHUNK)
         self._readers.add(reader)
         return reader
 

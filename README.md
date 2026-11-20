@@ -50,11 +50,36 @@ Archive 接收文本路径或产生文本路径的 PathLike，父目录须存在
 - `attachment(name)` 返回拥有独立数据库连接的可关闭二进制读取器，支持 read、readinto、上下文管理，不支持 seek。缺失抛 KeyError。读取器从头读取完整原始字节，可交错打开多个。
 - `close()` 幂等，关闭仍存活的全部附件读取器和主连接。已关闭 Archive 不可查询。写事务内部查询 Archive、再开事务或关闭 Archive 均抛 RuntimeError。
 
-附件不自动关联任何行，也不保证内容是 XML。平面导入不会自动创建附件。本项目不提供 ingest_scoped 或 evidence 接口，不生成 XML 记录片段。
+附件不自动关联任何行，也不保证内容是 XML。平面导入不会自动创建附件。
+
+## 作用域记录与独立 XML 证据
+
+`Archive.ingest_scoped(chunks, record_name, source_base) -> int` 在保持上述平面能力
+不变的前提下，按 XML 命名空间作用域导入结构化记录，并为每行保存一份可独立重放的
+完整 XML 证据。契约细节见 SCOPED.md，交接不变量见 SCOPED_HANDOFF.md。
+
+- `record_name` 是 `(namespace_uri, local_name)`，按展开名精确选择记录，允许嵌套，
+  文档根也可被选中；`local_name` 须为合法 NCName，URI 允许空串。
+- `source_base` 是绝对 http/https URI（不访问网络）。逐层 `xml:base` 用
+  `urllib.parse.urljoin` 解释；记录 `kind` 在其命名空间作用域内解释成
+  `(kind_uri, kind_local)`，`href` 按有效基准解析成绝对 URI 后存入既有 `records` 表。
+- 选中元素必须带无命名空间的 `id`、`kind`、`href`；身份在仓库内唯一，冲突整次回滚。
+  拒绝 DTD、外部实体、`xml:lang`、`xml:space`、未绑定 QName 前缀及非法 XML；
+  仅接受 UTF-8/UTF8 声明。源迭代异常原样传播（保留对象身份）。
+- `Archive.evidence(id)` 返回从头读取该记录证据的可关闭二进制读取器，支持
+  `read`、`readinto` 与上下文管理，不要求 seek；持久化、可交错、关闭重开保真。
+  缺少记录或该旧行没有证据时抛 `KeyError`。证据键空间与通用附件相互独立：同名附件
+  不会被认作证据，也不会被覆盖；平面导入和手工 `add_row` 的旧行不补造证据。
+- 每份证据以记录元素为文档根并包含完整后代，根上补齐闭合作用域所需的命名空间声明和
+  绝对 `xml:base`。脱离原文祖先与原地址后独立解析，展开名、字符数据顺序、记录分类与
+  绝对地址均与源文一致。CDATA 与字符引用可改写为等价字符数据，普通属性文本值保留。
+- 导入工作内存只随输入块、深度及沿途开始标签/作用域增长，不缓存整条记录，长注释和
+  处理指令同样满足；证据流式落到临时侧车后在同一事务内发布，失败整次回滚并清理临时
+  内容。资源实测入口为 `python3.11 -B resource_probe.py`。
 
 ## 存储和资源
 
-SQLite user_version=1。records 保存 id、kind_uri、kind_local、href；attachments 保存名称、长度、摘要；attachment_chunks 以 (name, part) 排序保存原始 bytes。每个非空输入块对应一行，未做块合并或压缩。事务使用 SQLite，附件与行存放于同一数据库；WAL 和 SHM 是 SQLite 管理的同目录文件。附件读取连接只读且 query_only。
+SQLite user_version=1。records 保存 id、kind_uri、kind_local、href；attachments 保存名称、长度、摘要；attachment_chunks 以 (name, part) 排序保存原始 bytes。作用域扩展另增 evidences 与 evidence_chunks 两张表（以 (id, part) 排序保存证据 bytes），与附件表互不影响，旧 v1 数据库可直接打开并继续追加。每个非空输入块对应一行，未做块合并或压缩。事务使用 SQLite，附件、证据与行存放于同一数据库；WAL 和 SHM 是 SQLite 管理的同目录文件。附件与证据读取连接只读且 query_only。
 
 XML 转换不缓存记录正文；工作状态包括当前输入块、解析器开始标签信息及当前块产生的行。附件写入和有大小限制的读取按块处理；无参 read 和 ids 会按调用者请求分配完整结果。每个数据库连接的页面缓存设为约 512 KiB。
 
