@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="urn:feed" xmlns:r="urn:record" xmlns:k="urn:outer" xml:base="daily/">
+  <r:item id="outer" kind="k:Batch" href="a.xml">before
+    <r:item xmlns:k="urn:inner" xml:base="../detail/" id="inner" kind="k:Part" href="b.xml"><![CDATA[中<&]]>&amp;<plain xmlns="" note="k:literal"/></r:item>after
+  </r:item>
+</feed>

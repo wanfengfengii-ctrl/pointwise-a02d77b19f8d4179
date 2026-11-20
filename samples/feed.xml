@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed>
+  <!-- Supplier's two flat records. Body text is accepted but not retained. -->
+  <r id="sale-1" kind="Sale" href="https://vendor.example/daily/1">first &amp; paid</r>
+  <r id="退货-2" kind="Return" href="https://vendor.example/daily/2"><![CDATA[return <review>]]></r>
+</feed>
